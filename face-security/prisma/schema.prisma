@@ -8,28 +8,19 @@ datasource db {
 }
 
 model FaceUser {
-  id           String    @id @default(cuid())
-  email        String    @unique
-  faceTemplate Json
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-
-  sessions     Session[]
+  id          String       @id @default(cuid())
+  email       String       @unique
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  faceProfile FaceProfile?
 }
 
-model Session {
-  id         String   @id @default(cuid())
-  tokenHash  String   @unique
-  userId     String
-  expiresAt  DateTime
-  createdAt  DateTime @default(now())
+model FaceProfile {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  descriptors Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  user       FaceUser @relation(
-    fields: [userId],
-    references: [id],
-    onDelete: Cascade
-  )
-
-  @@index([userId])
-  @@index([expiresAt])
+  user FaceUser @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
