@@ -8,19 +8,104 @@ import { PrismaClient } from "@prisma/client";
 
 dotenv.config();
 
+/* =========================================================
+   CONFIGURATION
+========================================================= */
+
 const app = express();
-const prisma = new PrismaClient();
+
+const prisma = new PrismaClient({
+    log: ["error", "warn"]
+});
 
 const PORT = Number(process.env.PORT) || 10000;
 
 const FRONTEND_URL =
-    process.env.FRONTEND_URL || "*";
+    process.env.FRONTEND_URL ||
+    "https://legacy-lens.onrender.com";
+
+/* =========================================================
+   STARTUP CONFIG CHECK
+========================================================= */
+
+console.log("======================================");
+console.log("Legacy Lens AI Face Security");
+console.log("======================================");
+
+console.log("Environment:", process.env.NODE_ENV || "production");
+console.log("Port:", PORT);
+console.log("Frontend URL:", FRONTEND_URL);
+console.log(
+    "DATABASE_URL:",
+    process.env.DATABASE_URL
+        ? "SET"
+        : "NOT SET"
+);
+
+/* =========================================================
+   EXPRESS SECURITY
+========================================================= */
 
 app.disable("x-powered-by");
+
 app.set("trust proxy", 1);
 
 /* =========================================================
-   SECURITY
+   CORS
+========================================================= */
+
+const allowedOrigins = [
+    "https://legacy-lens.onrender.com",
+    FRONTEND_URL
+].filter(Boolean);
+
+app.use(
+    cors({
+        origin: function (origin, callback) {
+            /*
+             * Requests without an Origin header can happen from:
+             * curl, Render health checks, Postman, server-side tools, etc.
+             */
+            if (!origin) {
+                return callback(null, true);
+            }
+
+            if (allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            }
+
+            console.warn(
+                "CORS blocked origin:",
+                origin
+            );
+
+            return callback(
+                new Error(
+                    `CORS blocked origin: ${origin}`
+                )
+            );
+        },
+
+        methods: [
+            "GET",
+            "POST",
+            "DELETE",
+            "OPTIONS"
+        ],
+
+        allowedHeaders: [
+            "Content-Type",
+            "Authorization"
+        ],
+
+        credentials: false,
+
+        optionsSuccessStatus: 204
+    })
+);
+
+/* =========================================================
+   HELMET
 ========================================================= */
 
 app.use(
@@ -29,24 +114,9 @@ app.use(
     })
 );
 
-app.use(
-    cors({
-        origin:
-            FRONTEND_URL === "*"
-                ? true
-                : FRONTEND_URL,
-        methods: [
-            "GET",
-            "POST",
-            "DELETE",
-            "OPTIONS"
-        ],
-        allowedHeaders: [
-            "Content-Type",
-            "Authorization"
-        ]
-    })
-);
+/* =========================================================
+   BODY PARSER
+========================================================= */
 
 app.use(
     express.json({
@@ -55,17 +125,36 @@ app.use(
 );
 
 /* =========================================================
-   RATE LIMITING
+   REQUEST LOGGER
+========================================================= */
+
+app.use(
+    (req, res, next) => {
+        console.log(
+            `${new Date().toISOString()} ${req.method} ${req.originalUrl}`
+        );
+
+        next();
+    }
+);
+
+/* =========================================================
+   RATE LIMITERS
 ========================================================= */
 
 const faceRegisterLimiter =
     rateLimit({
         windowMs: 15 * 60 * 1000,
+
         max: 10,
+
         standardHeaders: true,
+
         legacyHeaders: false,
+
         message: {
             success: false,
+            registered: false,
             message:
                 "Too many registration attempts. Please wait and try again."
         }
@@ -74,9 +163,13 @@ const faceRegisterLimiter =
 const faceLoginLimiter =
     rateLimit({
         windowMs: 15 * 60 * 1000,
+
         max: 30,
+
         standardHeaders: true,
+
         legacyHeaders: false,
+
         message: {
             success: false,
             authenticated: false,
@@ -84,6 +177,12 @@ const faceLoginLimiter =
                 "Too many login attempts. Please wait and try again."
         }
     });
+
+/* =========================================================
+   DATABASE STATE
+========================================================= */
+
+let databaseReady = false;
 
 /* =========================================================
    HELPERS
@@ -101,10 +200,9 @@ function validEmail(email) {
     );
 }
 
-/*
-    Face-api.js descriptors normally contain
-    exactly 128 numeric values.
-*/
+/* =========================================================
+   DESCRIPTOR VALIDATION
+========================================================= */
 
 function validateDescriptor(descriptor) {
     if (!Array.isArray(descriptor)) {
@@ -122,23 +220,14 @@ function validateDescriptor(descriptor) {
     );
 }
 
-/*
-    Convert every descriptor value to a normal
-    JavaScript Number.
-
-    This prevents problems if the browser sends
-    Float32Array-like values.
-*/
-
 function cleanDescriptor(descriptor) {
     if (!Array.isArray(descriptor)) {
         return null;
     }
 
-    const cleaned =
-        descriptor.map(value =>
-            Number(value)
-        );
+    const cleaned = descriptor.map(
+        value => Number(value)
+    );
 
     if (!validateDescriptor(cleaned)) {
         return null;
@@ -152,13 +241,10 @@ function cleanDescriptors(descriptors) {
         return null;
     }
 
-    const cleaned =
-        descriptors.map(
-            descriptor =>
-                cleanDescriptor(
-                    descriptor
-                )
-        );
+    const cleaned = descriptors.map(
+        descriptor =>
+            cleanDescriptor(descriptor)
+    );
 
     if (
         cleaned.some(
@@ -172,9 +258,9 @@ function cleanDescriptors(descriptors) {
     return cleaned;
 }
 
-/*
-    Euclidean distance between two face descriptors.
-*/
+/* =========================================================
+   FACE DISTANCE
+========================================================= */
 
 function faceDistance(a, b) {
     if (
@@ -186,11 +272,7 @@ function faceDistance(a, b) {
 
     let sum = 0;
 
-    for (
-        let i = 0;
-        i < 128;
-        i++
-    ) {
+    for (let i = 0; i < 128; i++) {
         const difference =
             a[i] - b[i];
 
@@ -202,27 +284,22 @@ function faceDistance(a, b) {
     return Math.sqrt(sum);
 }
 
-/*
-    Average multiple face descriptors
-    into one face template.
-*/
+/* =========================================================
+   AVERAGE DESCRIPTORS
+========================================================= */
 
 function averageDescriptors(
     descriptors
 ) {
-    if (
-        !Array.isArray(descriptors) ||
-        descriptors.length === 0
-    ) {
-        return null;
-    }
-
     const cleaned =
         cleanDescriptors(
             descriptors
         );
 
-    if (!cleaned) {
+    if (
+        !cleaned ||
+        cleaned.length === 0
+    ) {
         return null;
     }
 
@@ -233,21 +310,13 @@ function averageDescriptors(
         const descriptor
         of cleaned
     ) {
-        for (
-            let i = 0;
-            i < 128;
-            i++
-        ) {
+        for (let i = 0; i < 128; i++) {
             average[i] +=
                 descriptor[i];
         }
     }
 
-    for (
-        let i = 0;
-        i < 128;
-        i++
-    ) {
+    for (let i = 0; i < 128; i++) {
         average[i] =
             average[i] /
             cleaned.length;
@@ -273,7 +342,97 @@ function createSessionToken() {
         .toString("hex");
 }
 
+/* =========================================================
+   DATABASE CONNECTION
+========================================================= */
+
+async function connectDatabase() {
+    try {
+        if (!process.env.DATABASE_URL) {
+            console.error(
+                "DATABASE_URL is not configured."
+            );
+
+            databaseReady = false;
+
+            return false;
+        }
+
+        await prisma.$connect();
+
+        await prisma.$queryRaw`
+            SELECT 1
+        `;
+
+        databaseReady = true;
+
+        console.log(
+            "PostgreSQL: CONNECTED"
+        );
+
+        return true;
+
+    } catch (error) {
+
+        databaseReady = false;
+
+        console.error(
+            "======================================"
+        );
+
+        console.error(
+            "POSTGRESQL CONNECTION FAILED"
+        );
+
+        console.error(
+            "Message:",
+            error?.message
+        );
+
+        console.error(
+            "Code:",
+            error?.code || "N/A"
+        );
+
+        console.error(
+            "======================================"
+        );
+
+        return false;
+    }
+}
+
+/* =========================================================
+   DATABASE CHECK MIDDLEWARE
+========================================================= */
+
+function requireDatabase(
+    req,
+    res,
+    next
+) {
+    if (!databaseReady) {
+        return res.status(503).json({
+            success: false,
+            message:
+                "Database is not connected.",
+            error:
+                "The face security server cannot access PostgreSQL."
+        });
+    }
+
+    next();
+}
+
+/* =========================================================
+   EXPIRED SESSION CLEANUP
+========================================================= */
+
 async function deleteExpiredSessions() {
+    if (!databaseReady) {
+        return;
+    }
+
     try {
         await prisma.session.deleteMany({
             where: {
@@ -282,10 +441,12 @@ async function deleteExpiredSessions() {
                 }
             }
         });
+
     } catch (error) {
+
         console.error(
             "Expired session cleanup error:",
-            error
+            error?.message
         );
     }
 }
@@ -306,7 +467,11 @@ app.get(
             success: true,
             service:
                 "Legacy Lens AI Face Security",
-            status: "online"
+            status: "online",
+            database:
+                databaseReady
+                    ? "connected"
+                    : "disconnected"
         });
     }
 );
@@ -318,27 +483,49 @@ app.get(
 app.get(
     "/api/health",
     async (req, res) => {
+
         try {
+
+            if (!process.env.DATABASE_URL) {
+                return res.status(503).json({
+                    success: false,
+                    service:
+                        "Legacy Lens AI Face Security",
+                    status: "online",
+                    database:
+                        "not_configured",
+                    message:
+                        "DATABASE_URL is missing from the server environment."
+                });
+            }
+
             await prisma.$queryRaw`
                 SELECT 1
             `;
 
-            res.json({
+            databaseReady = true;
+
+            return res.json({
                 success: true,
                 service:
                     "Legacy Lens AI Face Security",
                 status: "online",
                 database:
-                    "connected"
+                    "connected",
+                frontend:
+                    FRONTEND_URL
             });
 
         } catch (error) {
+
+            databaseReady = false;
+
             console.error(
-                "Health check error:",
+                "Health check database error:",
                 error
             );
 
-            res.status(500).json({
+            return res.status(503).json({
                 success: false,
                 service:
                     "Legacy Lens AI Face Security",
@@ -346,7 +533,8 @@ app.get(
                 database:
                     "disconnected",
                 error:
-                    error.message
+                    error?.message ||
+                    "Database connection failed."
             });
         }
     }
@@ -359,6 +547,7 @@ app.get(
 app.post(
     "/api/face/register",
     faceRegisterLimiter,
+    requireDatabase,
     async (req, res) => {
 
         console.log(
@@ -380,7 +569,7 @@ app.post(
                 req.body?.descriptors;
 
             console.log(
-                "Email:",
+                "Registration email:",
                 email
             );
 
@@ -473,23 +662,23 @@ app.post(
             ) {
 
                 console.error(
-                    "Invalid descriptor detected."
+                    "Invalid descriptor received."
                 );
 
                 return res.status(400).json({
                     success: false,
                     registered: false,
                     message:
-                        "One or more face descriptors are invalid. Each face descriptor must contain exactly 128 numeric values."
+                        "One or more face descriptors are invalid. Each descriptor must contain exactly 128 numeric values."
                 });
             }
 
             console.log(
-                "All descriptors valid."
+                "All descriptors are valid."
             );
 
             /* -----------------------------------------
-               CREATE TEMPLATE
+               CREATE FACE TEMPLATE
             ----------------------------------------- */
 
             const faceTemplate =
@@ -532,7 +721,7 @@ app.post(
             if (existing) {
 
                 console.log(
-                    "Existing account found. Updating face."
+                    "Existing face account found."
                 );
 
                 user =
@@ -579,14 +768,19 @@ app.post(
             });
 
             console.log(
-                `Face registered successfully for ${email}`
+                "FACE REGISTRATION SUCCESS"
+            );
+
+            console.log(
+                "Email:",
+                email
             );
 
             console.log(
                 "======================================"
             );
 
-            return res.json({
+            return res.status(200).json({
                 success: true,
                 registered: true,
                 email,
@@ -605,33 +799,27 @@ app.post(
             );
 
             console.error(
-                error
-            );
-
-            console.error(
                 "Message:",
                 error?.message
             );
 
             console.error(
                 "Code:",
-                error?.code
+                error?.code || null
             );
 
             console.error(
                 "Meta:",
-                error?.meta
+                error?.meta || null
+            );
+
+            console.error(
+                error
             );
 
             console.error(
                 "======================================"
             );
-
-            /*
-                IMPORTANT:
-                Return the actual Prisma error during
-                debugging instead of always hiding it.
-            */
 
             return res.status(500).json({
                 success: false,
@@ -640,7 +828,7 @@ app.post(
                     "Face registration failed.",
                 error:
                     error?.message ||
-                    "Unknown server error.",
+                    "Unknown database/server error.",
                 code:
                     error?.code || null
             });
@@ -654,6 +842,7 @@ app.post(
 
 app.post(
     "/api/face/status",
+    requireDatabase,
     async (req, res) => {
 
         try {
@@ -712,7 +901,8 @@ app.post(
                 message:
                     "Unable to check face status.",
                 error:
-                    error?.message
+                    error?.message ||
+                    "Unknown database error."
             });
         }
     }
@@ -725,6 +915,7 @@ app.post(
 app.post(
     "/api/face/login",
     faceLoginLimiter,
+    requireDatabase,
     async (req, res) => {
 
         try {
@@ -738,6 +929,10 @@ app.post(
                 cleanDescriptor(
                     req.body?.descriptor
                 );
+
+            /* -----------------------------------------
+               EMAIL
+            ----------------------------------------- */
 
             if (!email) {
 
@@ -759,6 +954,10 @@ app.post(
                 });
             }
 
+            /* -----------------------------------------
+               DESCRIPTOR
+            ----------------------------------------- */
+
             if (!descriptor) {
 
                 return res.status(400).json({
@@ -768,6 +967,10 @@ app.post(
                         "Invalid face descriptor. The camera did not produce a valid 128-value face descriptor."
                 });
             }
+
+            /* -----------------------------------------
+               FIND USER
+            ----------------------------------------- */
 
             const user =
                 await prisma.faceUser.findUnique({
@@ -787,6 +990,10 @@ app.post(
                 });
             }
 
+            /* -----------------------------------------
+               STORED TEMPLATE
+            ----------------------------------------- */
+
             const registeredDescriptor =
                 cleanDescriptor(
                     user.faceTemplate
@@ -804,6 +1011,10 @@ app.post(
                 });
             }
 
+            /* -----------------------------------------
+               COMPARE
+            ----------------------------------------- */
+
             const distance =
                 faceDistance(
                     descriptor,
@@ -811,12 +1022,12 @@ app.post(
                 );
 
             /*
-                0.45 is a common starting point
-                for face-api.js Euclidean matching.
-
-                Smaller = stricter.
-                Larger = more forgiving.
-            */
+             * face-api.js Euclidean distance.
+             *
+             * Smaller = more similar.
+             *
+             * 0.45 = fairly strict starting point.
+             */
 
             const MATCH_THRESHOLD =
                 0.45;
@@ -864,7 +1075,10 @@ app.post(
                     authenticated: false,
                     message:
                         "Face not recognized. Login denied.",
-                    distance
+                    distance:
+                        Number(
+                            distance.toFixed(6)
+                        )
                 });
             }
 
@@ -923,7 +1137,8 @@ app.post(
                 message:
                     "Unable to complete face login.",
                 error:
-                    error?.message,
+                    error?.message ||
+                    "Unknown server error.",
                 code:
                     error?.code || null
             });
@@ -932,11 +1147,12 @@ app.post(
 );
 
 /* =========================================================
-   SESSION
+   SESSION VALIDATION
 ========================================================= */
 
 app.post(
     "/api/face/session",
+    requireDatabase,
     async (req, res) => {
 
         try {
@@ -1025,7 +1241,8 @@ app.post(
                 message:
                     "Unable to validate authentication session.",
                 error:
-                    error?.message
+                    error?.message ||
+                    "Unknown database error."
             });
         }
     }
@@ -1037,6 +1254,7 @@ app.post(
 
 app.post(
     "/api/face/logout",
+    requireDatabase,
     async (req, res) => {
 
         try {
@@ -1082,7 +1300,8 @@ app.post(
                 message:
                     "Unable to log out.",
                 error:
-                    error?.message
+                    error?.message ||
+                    "Unknown database error."
             });
         }
     }
@@ -1094,6 +1313,7 @@ app.post(
 
 app.delete(
     "/api/face/remove",
+    requireDatabase,
     async (req, res) => {
 
         try {
@@ -1163,7 +1383,8 @@ app.delete(
                 message:
                     "Unable to remove face data.",
                 error:
-                    error?.message,
+                    error?.message ||
+                    "Unknown database error.",
                 code:
                     error?.code || null
             });
@@ -1181,7 +1402,9 @@ app.use(
         return res.status(404).json({
             success: false,
             message:
-                "Endpoint not found."
+                "Endpoint not found.",
+            path:
+                req.originalUrl
         });
     }
 );
@@ -1199,16 +1422,41 @@ app.use(
     ) => {
 
         console.error(
-            "GLOBAL ERROR:",
+            "======================================"
+        );
+
+        console.error(
+            "GLOBAL ERROR"
+        );
+
+        console.error(
             error
         );
+
+        console.error(
+            "======================================"
+        );
+
+        if (
+            error?.message?.startsWith(
+                "CORS blocked origin:"
+            )
+        ) {
+
+            return res.status(403).json({
+                success: false,
+                message:
+                    error.message
+            });
+        }
 
         return res.status(500).json({
             success: false,
             message:
                 "Internal server error.",
             error:
-                error?.message
+                error?.message ||
+                "Unknown server error."
         });
     }
 );
@@ -1235,7 +1483,11 @@ const server =
             );
 
             console.log(
-                `Port: ${PORT}`
+                `Server listening on port ${PORT}`
+            );
+
+            console.log(
+                `Frontend: ${FRONTEND_URL}`
             );
 
             console.log(
@@ -1266,24 +1518,22 @@ const server =
                 "Remove: /api/face/remove"
             );
 
-            try {
+            console.log(
+                "======================================"
+            );
 
-                await prisma.$connect();
+            await connectDatabase();
 
-                console.log(
-                    "PostgreSQL: CONNECTED"
-                );
+            console.log(
+                "======================================"
+            );
 
-            } catch (error) {
-
-                console.error(
-                    "POSTGRESQL CONNECTION FAILED"
-                );
-
-                console.error(
-                    error
-                );
-            }
+            console.log(
+                "Database status:",
+                databaseReady
+                    ? "CONNECTED"
+                    : "DISCONNECTED"
+            );
 
             console.log(
                 "======================================"
@@ -1307,18 +1557,22 @@ server.on(
 );
 
 /* =========================================================
-   SHUTDOWN
+   GRACEFUL SHUTDOWN
 ========================================================= */
 
 async function shutdown() {
 
     console.log(
-        "Shutting down..."
+        "Shutting down Legacy Lens AI server..."
     );
 
     try {
 
         await prisma.$disconnect();
+
+        console.log(
+            "Database disconnected."
+        );
 
     } catch (error) {
 
