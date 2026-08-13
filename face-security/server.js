@@ -11,14 +11,17 @@ dotenv.config();
 const app = express();
 const prisma = new PrismaClient();
 
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT) || 10000;
 
 const FRONTEND_URL =
     process.env.FRONTEND_URL || "*";
 
 app.disable("x-powered-by");
-
 app.set("trust proxy", 1);
+
+/* =========================================================
+   SECURITY
+========================================================= */
 
 app.use(
     helmet({
@@ -47,12 +50,12 @@ app.use(
 
 app.use(
     express.json({
-        limit: "5mb"
+        limit: "10mb"
     })
 );
 
 /* =========================================================
-   RATE LIMITERS
+   RATE LIMITING
 ========================================================= */
 
 const faceRegisterLimiter =
@@ -64,21 +67,21 @@ const faceRegisterLimiter =
         message: {
             success: false,
             message:
-                "Too many face registration attempts. Please try again later."
+                "Too many registration attempts. Please wait and try again."
         }
     });
 
 const faceLoginLimiter =
     rateLimit({
         windowMs: 15 * 60 * 1000,
-        max: 20,
+        max: 30,
         standardHeaders: true,
         legacyHeaders: false,
         message: {
             success: false,
             authenticated: false,
             message:
-                "Too many face login attempts. Please try again later."
+                "Too many login attempts. Please wait and try again."
         }
     });
 
@@ -98,6 +101,11 @@ function validEmail(email) {
     );
 }
 
+/*
+    Face-api.js descriptors normally contain
+    exactly 128 numeric values.
+*/
+
 function validateDescriptor(descriptor) {
     if (!Array.isArray(descriptor)) {
         return false;
@@ -114,18 +122,75 @@ function validateDescriptor(descriptor) {
     );
 }
 
+/*
+    Convert every descriptor value to a normal
+    JavaScript Number.
+
+    This prevents problems if the browser sends
+    Float32Array-like values.
+*/
+
+function cleanDescriptor(descriptor) {
+    if (!Array.isArray(descriptor)) {
+        return null;
+    }
+
+    const cleaned =
+        descriptor.map(value =>
+            Number(value)
+        );
+
+    if (!validateDescriptor(cleaned)) {
+        return null;
+    }
+
+    return cleaned;
+}
+
+function cleanDescriptors(descriptors) {
+    if (!Array.isArray(descriptors)) {
+        return null;
+    }
+
+    const cleaned =
+        descriptors.map(
+            descriptor =>
+                cleanDescriptor(
+                    descriptor
+                )
+        );
+
+    if (
+        cleaned.some(
+            descriptor =>
+                descriptor === null
+        )
+    ) {
+        return null;
+    }
+
+    return cleaned;
+}
+
+/*
+    Euclidean distance between two face descriptors.
+*/
+
 function faceDistance(a, b) {
     if (
-        !Array.isArray(a) ||
-        !Array.isArray(b) ||
-        a.length !== b.length
+        !validateDescriptor(a) ||
+        !validateDescriptor(b)
     ) {
         return Infinity;
     }
 
     let sum = 0;
 
-    for (let i = 0; i < a.length; i++) {
+    for (
+        let i = 0;
+        i < 128;
+        i++
+    ) {
         const difference =
             a[i] - b[i];
 
@@ -137,6 +202,11 @@ function faceDistance(a, b) {
     return Math.sqrt(sum);
 }
 
+/*
+    Average multiple face descriptors
+    into one face template.
+*/
+
 function averageDescriptors(
     descriptors
 ) {
@@ -147,19 +217,25 @@ function averageDescriptors(
         return null;
     }
 
-    const length =
-        descriptors[0].length;
+    const cleaned =
+        cleanDescriptors(
+            descriptors
+        );
+
+    if (!cleaned) {
+        return null;
+    }
 
     const average =
-        new Array(length).fill(0);
+        new Array(128).fill(0);
 
     for (
         const descriptor
-        of descriptors
+        of cleaned
     ) {
         for (
             let i = 0;
-            i < length;
+            i < 128;
             i++
         ) {
             average[i] +=
@@ -169,25 +245,20 @@ function averageDescriptors(
 
     for (
         let i = 0;
-        i < length;
+        i < 128;
         i++
     ) {
-        average[i] /=
-            descriptors.length;
+        average[i] =
+            average[i] /
+            cleaned.length;
     }
 
     return average;
 }
 
-/*
-    We never store the raw session token in the database.
-
-    Browser:
-        token
-
-    Database:
-        SHA-256(token)
-*/
+/* =========================================================
+   SESSION HELPERS
+========================================================= */
 
 function hashToken(token) {
     return crypto
@@ -231,7 +302,7 @@ setInterval(
 app.get(
     "/",
     (req, res) => {
-        return res.json({
+        res.json({
             success: true,
             service:
                 "Legacy Lens AI Face Security",
@@ -248,9 +319,11 @@ app.get(
     "/api/health",
     async (req, res) => {
         try {
-            await prisma.$queryRaw`SELECT 1`;
+            await prisma.$queryRaw`
+                SELECT 1
+            `;
 
-            return res.json({
+            res.json({
                 success: true,
                 service:
                     "Legacy Lens AI Face Security",
@@ -261,17 +334,19 @@ app.get(
 
         } catch (error) {
             console.error(
-                "Database health error:",
+                "Health check error:",
                 error
             );
 
-            return res.status(500).json({
+            res.status(500).json({
                 success: false,
                 service:
                     "Legacy Lens AI Face Security",
                 status: "online",
                 database:
-                    "disconnected"
+                    "disconnected",
+                error:
+                    error.message
             });
         }
     }
@@ -286,6 +361,14 @@ app.post(
     faceRegisterLimiter,
     async (req, res) => {
 
+        console.log(
+            "======================================"
+        );
+
+        console.log(
+            "FACE REGISTRATION REQUEST"
+        );
+
         try {
 
             const email =
@@ -296,61 +379,126 @@ app.post(
             const descriptors =
                 req.body?.descriptors;
 
+            console.log(
+                "Email:",
+                email
+            );
+
+            console.log(
+                "Descriptor count:",
+                Array.isArray(
+                    descriptors
+                )
+                    ? descriptors.length
+                    : "NOT ARRAY"
+            );
+
+            /* -----------------------------------------
+               EMAIL
+            ----------------------------------------- */
+
             if (!email) {
+
                 return res.status(400).json({
                     success: false,
+                    registered: false,
                     message:
                         "Email address is required."
                 });
             }
 
             if (!validEmail(email)) {
+
                 return res.status(400).json({
                     success: false,
+                    registered: false,
                     message:
                         "Please provide a valid email address."
                 });
             }
 
+            /* -----------------------------------------
+               DESCRIPTORS
+            ----------------------------------------- */
+
             if (
                 !Array.isArray(
                     descriptors
-                ) ||
-                descriptors.length < 3 ||
-                descriptors.length > 10
+                )
             ) {
+
                 return res.status(400).json({
                     success: false,
+                    registered: false,
                     message:
-                        "Please provide between 3 and 10 face captures."
+                        "Face descriptors were not received as an array."
                 });
             }
 
-            for (
-                const descriptor
-                of descriptors
+            if (
+                descriptors.length < 3
             ) {
 
-                if (
-                    !validateDescriptor(
-                        descriptor
-                    )
-                ) {
-
-                    return res.status(400).json({
-                        success: false,
-                        message:
-                            "Invalid face descriptor received."
-                    });
-                }
+                return res.status(400).json({
+                    success: false,
+                    registered: false,
+                    message:
+                        `Only ${descriptors.length} face capture(s) were received. At least 3 are required.`
+                });
             }
 
-            const faceTemplate =
-                averageDescriptors(
+            if (
+                descriptors.length > 10
+            ) {
+
+                return res.status(400).json({
+                    success: false,
+                    registered: false,
+                    message:
+                        "Too many face captures. Maximum is 10."
+                });
+            }
+
+            /* -----------------------------------------
+               CLEAN DESCRIPTORS
+            ----------------------------------------- */
+
+            const cleanedDescriptors =
+                cleanDescriptors(
                     descriptors
                 );
 
             if (
+                !cleanedDescriptors
+            ) {
+
+                console.error(
+                    "Invalid descriptor detected."
+                );
+
+                return res.status(400).json({
+                    success: false,
+                    registered: false,
+                    message:
+                        "One or more face descriptors are invalid. Each face descriptor must contain exactly 128 numeric values."
+                });
+            }
+
+            console.log(
+                "All descriptors valid."
+            );
+
+            /* -----------------------------------------
+               CREATE TEMPLATE
+            ----------------------------------------- */
+
+            const faceTemplate =
+                averageDescriptors(
+                    cleanedDescriptors
+                );
+
+            if (
+                !faceTemplate ||
                 !validateDescriptor(
                     faceTemplate
                 )
@@ -358,14 +506,19 @@ app.post(
 
                 return res.status(400).json({
                     success: false,
+                    registered: false,
                     message:
-                        "Unable to create face template."
+                        "The server could not create a valid face template."
                 });
             }
 
-            /*
-                Find existing account.
-            */
+            console.log(
+                "Face template created."
+            );
+
+            /* -----------------------------------------
+               FIND EXISTING USER
+            ----------------------------------------- */
 
             const existing =
                 await prisma.faceUser.findUnique({
@@ -378,33 +531,45 @@ app.post(
 
             if (existing) {
 
+                console.log(
+                    "Existing account found. Updating face."
+                );
+
                 user =
                     await prisma.faceUser.update({
                         where: {
                             email
                         },
                         data: {
-                            faceTemplate
+                            faceTemplate:
+                                faceTemplate
                         }
                     });
 
             } else {
 
+                console.log(
+                    "Creating new face account."
+                );
+
                 user =
                     await prisma.faceUser.create({
                         data: {
                             email,
-                            faceTemplate
+                            faceTemplate:
+                                faceTemplate
                         }
                     });
             }
 
-            /*
-                Delete old sessions.
+            console.log(
+                "Face user saved:",
+                user.id
+            );
 
-                If the user registers a new face,
-                old login sessions are invalidated.
-            */
+            /* -----------------------------------------
+               DELETE OLD SESSIONS
+            ----------------------------------------- */
 
             await prisma.session.deleteMany({
                 where: {
@@ -414,12 +579,17 @@ app.post(
             });
 
             console.log(
-                `Face registered for ${email}`
+                `Face registered successfully for ${email}`
+            );
+
+            console.log(
+                "======================================"
             );
 
             return res.json({
                 success: true,
                 registered: true,
+                email,
                 message:
                     "Face registered successfully."
             });
@@ -427,14 +597,52 @@ app.post(
         } catch (error) {
 
             console.error(
-                "Face registration error:",
+                "======================================"
+            );
+
+            console.error(
+                "FACE REGISTRATION ERROR"
+            );
+
+            console.error(
                 error
             );
 
+            console.error(
+                "Message:",
+                error?.message
+            );
+
+            console.error(
+                "Code:",
+                error?.code
+            );
+
+            console.error(
+                "Meta:",
+                error?.meta
+            );
+
+            console.error(
+                "======================================"
+            );
+
+            /*
+                IMPORTANT:
+                Return the actual Prisma error during
+                debugging instead of always hiding it.
+            */
+
             return res.status(500).json({
                 success: false,
+                registered: false,
                 message:
-                    "Unable to register your face."
+                    "Face registration failed.",
+                error:
+                    error?.message ||
+                    "Unknown server error.",
+                code:
+                    error?.code || null
             });
         }
     }
@@ -456,16 +664,20 @@ app.post(
                 );
 
             if (!email) {
+
                 return res.status(400).json({
                     success: false,
+                    registered: false,
                     message:
                         "Email address is required."
                 });
             }
 
             if (!validEmail(email)) {
+
                 return res.status(400).json({
                     success: false,
+                    registered: false,
                     message:
                         "Please provide a valid email address."
                 });
@@ -496,8 +708,11 @@ app.post(
 
             return res.status(500).json({
                 success: false,
+                registered: false,
                 message:
-                    "Unable to check face status."
+                    "Unable to check face status.",
+                error:
+                    error?.message
             });
         }
     }
@@ -520,46 +735,39 @@ app.post(
                 );
 
             const descriptor =
-                req.body?.descriptor;
+                cleanDescriptor(
+                    req.body?.descriptor
+                );
 
             if (!email) {
+
                 return res.status(400).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
                         "Email address is required."
                 });
             }
 
             if (!validEmail(email)) {
+
                 return res.status(400).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
                         "Please provide a valid email address."
                 });
             }
 
-            if (
-                !validateDescriptor(
-                    descriptor
-                )
-            ) {
+            if (!descriptor) {
 
                 return res.status(400).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
-                        "Invalid face descriptor."
+                        "Invalid face descriptor. The camera did not produce a valid 128-value face descriptor."
                 });
             }
-
-            /*
-                Find registered face.
-            */
 
             const user =
                 await prisma.faceUser.findUnique({
@@ -572,42 +780,29 @@ app.post(
 
                 return res.status(404).json({
                     success: false,
-                    authenticated:
-                        false,
-                    registered:
-                        false,
+                    authenticated: false,
+                    registered: false,
                     message:
                         "No face is registered for this account."
                 });
             }
 
-            /*
-                Prisma Json field already gives
-                us the descriptor as an array.
-            */
-
             const registeredDescriptor =
-                user.faceTemplate;
+                cleanDescriptor(
+                    user.faceTemplate
+                );
 
             if (
-                !validateDescriptor(
-                    registeredDescriptor
-                )
+                !registeredDescriptor
             ) {
 
                 return res.status(500).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
-                        "Stored face template is invalid."
+                        "The stored face template is invalid."
                 });
             }
-
-            /*
-                Compare NEW face against
-                REGISTERED face.
-            */
 
             const distance =
                 faceDistance(
@@ -616,9 +811,11 @@ app.post(
                 );
 
             /*
-                Lower distance = more similar.
+                0.45 is a common starting point
+                for face-api.js Euclidean matching.
 
-                0.45 = strict matching.
+                Smaller = stricter.
+                Larger = more forgiving.
             */
 
             const MATCH_THRESHOLD =
@@ -629,7 +826,7 @@ app.post(
                 MATCH_THRESHOLD;
 
             console.log(
-                "================================"
+                "======================================"
             );
 
             console.log(
@@ -637,45 +834,43 @@ app.post(
             );
 
             console.log(
-                `Email: ${email}`
+                "Email:",
+                email
             );
 
             console.log(
-                `Distance: ${distance}`
+                "Distance:",
+                distance
             );
 
             console.log(
-                `Threshold: ${MATCH_THRESHOLD}`
+                "Threshold:",
+                MATCH_THRESHOLD
             );
 
             console.log(
-                `Matched: ${matched}`
+                "Matched:",
+                matched
             );
 
             console.log(
-                "================================"
+                "======================================"
             );
-
-            /*
-                DIFFERENT FACE
-            */
 
             if (!matched) {
 
                 return res.status(401).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
-                        "Face not recognized. Login denied."
+                        "Face not recognized. Login denied.",
+                    distance
                 });
             }
 
-            /*
-                SAME FACE
-
-                Create persistent session.
-            */
+            /* -----------------------------------------
+               CREATE SESSION
+            ----------------------------------------- */
 
             const rawToken =
                 createSessionToken();
@@ -706,8 +901,7 @@ app.post(
 
             return res.json({
                 success: true,
-                authenticated:
-                    true,
+                authenticated: true,
                 email,
                 token:
                     rawToken,
@@ -725,17 +919,20 @@ app.post(
 
             return res.status(500).json({
                 success: false,
-                authenticated:
-                    false,
+                authenticated: false,
                 message:
-                    "Unable to complete face login."
+                    "Unable to complete face login.",
+                error:
+                    error?.message,
+                code:
+                    error?.code || null
             });
         }
     }
 );
 
 /* =========================================================
-   VALIDATE SESSION
+   SESSION
 ========================================================= */
 
 app.post(
@@ -746,16 +943,14 @@ app.post(
 
             const token =
                 String(
-                    req.body?.token ||
-                    ""
+                    req.body?.token || ""
                 ).trim();
 
             if (!token) {
 
                 return res.status(401).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
                         "Authentication token is required."
                 });
@@ -782,8 +977,7 @@ app.post(
 
                 return res.status(401).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
                         "Invalid authentication session."
                 });
@@ -803,8 +997,7 @@ app.post(
 
                 return res.status(401).json({
                     success: false,
-                    authenticated:
-                        false,
+                    authenticated: false,
                     message:
                         "Authentication session has expired."
                 });
@@ -812,8 +1005,7 @@ app.post(
 
             return res.json({
                 success: true,
-                authenticated:
-                    true,
+                authenticated: true,
                 email:
                     session.user.email,
                 expiresAt:
@@ -829,10 +1021,11 @@ app.post(
 
             return res.status(500).json({
                 success: false,
-                authenticated:
-                    false,
+                authenticated: false,
                 message:
-                    "Unable to validate authentication session."
+                    "Unable to validate authentication session.",
+                error:
+                    error?.message
             });
         }
     }
@@ -850,8 +1043,7 @@ app.post(
 
             const token =
                 String(
-                    req.body?.token ||
-                    ""
+                    req.body?.token || ""
                 ).trim();
 
             if (!token) {
@@ -888,7 +1080,9 @@ app.post(
             return res.status(500).json({
                 success: false,
                 message:
-                    "Unable to log out."
+                    "Unable to log out.",
+                error:
+                    error?.message
             });
         }
     }
@@ -944,12 +1138,6 @@ app.delete(
                 });
             }
 
-            /*
-                Sessions are deleted automatically
-                because schema.prisma uses
-                onDelete: Cascade.
-            */
-
             await prisma.faceUser.delete({
                 where: {
                     email
@@ -973,7 +1161,11 @@ app.delete(
             return res.status(500).json({
                 success: false,
                 message:
-                    "Unable to remove face data."
+                    "Unable to remove face data.",
+                error:
+                    error?.message,
+                code:
+                    error?.code || null
             });
         }
     }
@@ -1007,14 +1199,16 @@ app.use(
     ) => {
 
         console.error(
-            "Global server error:",
+            "GLOBAL ERROR:",
             error
         );
 
         return res.status(500).json({
             success: false,
             message:
-                "Internal server error."
+                "Internal server error.",
+            error:
+                error?.message
         });
     }
 );
@@ -1045,31 +1239,31 @@ const server =
             );
 
             console.log(
-                `Health: /api/health`
+                "Health: /api/health"
             );
 
             console.log(
-                `Register: /api/face/register`
+                "Register: /api/face/register"
             );
 
             console.log(
-                `Status: /api/face/status`
+                "Status: /api/face/status"
             );
 
             console.log(
-                `Login: /api/face/login`
+                "Login: /api/face/login"
             );
 
             console.log(
-                `Session: /api/face/session`
+                "Session: /api/face/session"
             );
 
             console.log(
-                `Logout: /api/face/logout`
+                "Logout: /api/face/logout"
             );
 
             console.log(
-                `Remove: /api/face/remove`
+                "Remove: /api/face/remove"
             );
 
             try {
@@ -1083,11 +1277,11 @@ const server =
             } catch (error) {
 
                 console.error(
-                    "PostgreSQL: CONNECTION FAILED"
+                    "POSTGRESQL CONNECTION FAILED"
                 );
 
                 console.error(
-                    error.message
+                    error
                 );
             }
 
@@ -1097,12 +1291,16 @@ const server =
         }
     );
 
+/* =========================================================
+   SERVER ERROR
+========================================================= */
+
 server.on(
     "error",
     error => {
 
         console.error(
-            "HTTP server error:",
+            "HTTP SERVER ERROR:",
             error
         );
     }
@@ -1118,7 +1316,17 @@ async function shutdown() {
         "Shutting down..."
     );
 
-    await prisma.$disconnect();
+    try {
+
+        await prisma.$disconnect();
+
+    } catch (error) {
+
+        console.error(
+            "Prisma disconnect error:",
+            error
+        );
+    }
 
     process.exit(0);
 }
